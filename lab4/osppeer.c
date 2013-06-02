@@ -148,7 +148,7 @@ typedef enum taskbufresult {		// Status of a read or write attempt.
 	TBUF_END = 0,			// => End of file, or buffer is full.
 	TBUF_OK = 1,			// => Successfully read data.
 	TBUF_AGAIN = 2			// => Did not read data this time.  The
-					//    caller should wait.
+							//    caller should wait.
 } taskbufresult_t;
 
 // read_to_taskbuf(fd, t)
@@ -759,13 +759,50 @@ int main(int argc, char *argv[])
 	register_files(tracker_task, myalias);
 
 	// First, download files named on command line.
+	pid_t pid;
 	for (; argc > 1; argc--, argv++)
 		if ((t = start_download(tracker_task, argv[1])))
-			task_download(t, tracker_task);
+		{
+			pid = fork();
+			if (pid < 0)
+			{
+				error("Fork failed during download.\n");
+				exit(0);
+			}
+			else if (pid == 0)
+			{
+				// If it's the child process:
+				// * download the file
+				// * then kill the child process
+				task_download(t, tracker_task);
+				_exit(0);
+			}
+			else
+				// If it's the parent process, continue on the main thread
+				continue;
+		}
 
 	// Then accept connections from other peers and upload files to them!
 	while ((t = task_listen(listen_task)))
-		task_upload(t);
+	{
+		pid = fork();
+		if (pid < 0)
+		{
+			error("Fork failed during upload.\n");
+			exit(0);
+		}	
+		else if (pid == 0)
+		{
+			// If it's the child process:
+			// * upload the file
+			// * then kill the child process
+			task_upload(t);
+			_exit(0);
+		}
+		else
+			// If it's the parent process, continue on the main thread
+			continue;
+	}
 
 	return 0;
 }
