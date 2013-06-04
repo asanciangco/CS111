@@ -37,6 +37,9 @@ static int listen_port;
 
 #define TASKBUFSIZ	4096	// Size of task_t::buf
 #define FILENAMESIZ	256	// Size of task_t::filename
+#define MAXFILESIZ 1000000000 // ~1 GB max file size
+#define SAMPLESIZ 8 //Sample size for xfer rate
+#define MINRATE 128
 
 typedef enum tasktype {		// Which type of connection is this?
 	TASK_TRACKER,		// => Tracker connection
@@ -148,7 +151,7 @@ typedef enum taskbufresult {		// Status of a read or write attempt.
 	TBUF_END = 0,			// => End of file, or buffer is full.
 	TBUF_OK = 1,			// => Successfully read data.
 	TBUF_AGAIN = 2			// => Did not read data this time.  The
-							//    caller should wait.
+					//    caller should wait.
 } taskbufresult_t;
 
 // read_to_taskbuf(fd, t)
@@ -476,7 +479,8 @@ task_t *start_download(task_t *tracker_task, const char *filename)
 		error("* Error while allocating task");
 		goto exit;
 	}
-	strcpy(t->filename, filename);
+	strncpy(t->filename, filename, FILENAMESIZ-1); //Buffer Overruns
+	t->filename[FILENAMESIZ-1] = '\0';
 
 	// add peers
 	s1 = tracker_task->buf;
@@ -502,7 +506,7 @@ task_t *start_download(task_t *tracker_task, const char *filename)
 //	until a download is successful.
 static void task_download(task_t *t, task_t *tracker_task)
 {
-	int i, ret = -1;
+	int i, ret = -1, rate = 0, count = 0;
 	assert((!t || t->type == TASK_DOWNLOAD)
 	       && tracker_task->type == TASK_TRACKER);
 
@@ -525,7 +529,17 @@ static void task_download(task_t *t, task_t *tracker_task)
 		error("* Cannot connect to peer: %s\n", strerror(errno));
 		goto try_again;
 	}
-	osp2p_writef(t->peer_fd, "GET %s OSP2P\n", t->filename);
+
+	// Buffer overflow attack!
+	if (evil_mode == 1)
+	{
+		char buffer_overflow[40000] = {'B', 'u', 'f', 'f', 'e', 'r', 'O', 'v', 'e', 'r', 'f', 'l', 'o', 'w', 'A', 't', 't', 'a', 'c', 'k', '!'};
+		osp2p_writef(t->peer_fd, "GET %s OSP2P\n", buffer_overflow);
+	}
+	else
+	{
+		osp2p_writef(t->peer_fd, "GET %s OSP2P\n", t->filename);
+	}
 
 	// Open disk file for the result.
 	// If the filename already exists, save the file in a name like
@@ -569,7 +583,25 @@ static void task_download(task_t *t, task_t *tracker_task)
 			error("* Disk write error");
 			goto try_again;
 		}
+		//Added: Part 2
+		if(t->total_written > MAXFILESIZ)
+		{
+			error("File too big, please try again");
+			goto try_again;
+		}
+		rate = t->total_written / count;
+		if(count >= SAMPLESIZ && rate < MINRATE)
+		{
+			error("Writing in too small of chunks, rate is slow");
+			goto try_again;
+		}
+
+		count++;
 	}
+
+
+
+
 
 	// Empty files are usually a symptom of some error.
 	if (t->total_written > 0) {
@@ -643,11 +675,23 @@ static void task_upload(task_t *t)
 	}
 
 	assert(t->head == 0);
+
+	if(t->tail >= FILENAMESIZ)
+	{
+		error("File Name Too Long");
+		goto exit;
+	}
 	if (osp2p_snscanf(t->buf, t->tail, "GET %s OSP2P\n", t->filename) < 0) {
 		error("* Odd request %.*s\n", t->tail, t->buf);
 		goto exit;
 	}
 	t->head = t->tail = 0;
+
+	if(strchr(t->filename, '/') != 0)
+	{
+		error("Filename Error: %s refers to a directory\n", t->filename);
+		goto exit;
+	}
 
 	t->disk_fd = open(t->filename, O_RDONLY);
 	if (t->disk_fd == -1) {
@@ -662,6 +706,14 @@ static void task_upload(task_t *t)
 		if (ret == TBUF_ERROR) {
 			error("* Peer write error");
 			goto exit;
+		}
+
+		if (evil_mode == 2)
+		{
+			// Reset the disk file descriptor to the beginning of the file
+			// each time, so it is continuously reading data until it finally
+			// overflows.
+			lseek(t->disk_fd, 0, 0);
 		}
 
 		ret = read_to_taskbuf(t->disk_fd, t);
@@ -758,51 +810,31 @@ int main(int argc, char *argv[])
 	listen_task = start_listen();
 	register_files(tracker_task, myalias);
 
+	pid_t p;
 	// First, download files named on command line.
-	pid_t pid;
 	for (; argc > 1; argc--, argv++)
 		if ((t = start_download(tracker_task, argv[1])))
 		{
-			pid = fork();
-			if (pid < 0)
+			if((p = fork()) < 0)
+				die("Fork Error");
+			else if (p == 0)
 			{
-				error("Fork failed during download.\n");
+				task_download(t, tracker_task);
 				exit(0);
 			}
-			else if (pid == 0)
-			{
-				// If it's the child process:
-				// * download the file
-				// * then kill the child process
-				task_download(t, tracker_task);
-				_exit(0);
-			}
-			else
-				// If it's the parent process, continue on the main thread
-				continue;
 		}
-
 	// Then accept connections from other peers and upload files to them!
 	while ((t = task_listen(listen_task)))
 	{
-		pid = fork();
-		if (pid < 0)
+		if((p = fork()) < 0)
+			die("Fork Error");
+		else if (p == 0)
 		{
-			error("Fork failed during upload.\n");
-			exit(0);
-		}	
-		else if (pid == 0)
-		{
-			// If it's the child process:
-			// * upload the file
-			// * then kill the child process
 			task_upload(t);
-			_exit(0);
+			exit(0);
 		}
-		else
-			// If it's the parent process, continue on the main thread
-			continue;
 	}
+
 
 	return 0;
 }
